@@ -1,0 +1,14 @@
+# Grid search results
+weights_grid_results_v0.csv
+weights_grid_results_v1.csv
+bm25_grid_results_v0.csv
+
+# Environment / local files
+env.yaml
+
+# Scripts / generated files
+graphframes.sh
+
+# Python cache
+__pycache__/
+*.pyc

@@ -1,4 +1,5 @@
 from flask import Flask, request, jsonify
+from search_engine import *
 
 class MyFlaskApp(Flask):
     def run(self, host=None, port=None, debug=None, **options):
@@ -6,6 +7,8 @@ class MyFlaskApp(Flask):
 
 app = MyFlaskApp(__name__)
 app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
+
+search_engine = SearchEngine("gcs", "ir_3_207472234")
 
 @app.route("/search")
 def search():
@@ -30,7 +33,7 @@ def search():
     if len(query) == 0:
       return jsonify(res)
     # BEGIN SOLUTION
-
+    res = search_engine.search(query=query)
     # END SOLUTION
     return jsonify(res)
 
@@ -55,7 +58,7 @@ def search_body():
     if len(query) == 0:
       return jsonify(res)
     # BEGIN SOLUTION
-
+    res = search_engine.search_body(query=query)
     # END SOLUTION
     return jsonify(res)
 
@@ -85,7 +88,7 @@ def search_title():
     if len(query) == 0:
       return jsonify(res)
     # BEGIN SOLUTION
-
+    res = search_engine.search_title(query=query)
     # END SOLUTION
     return jsonify(res)
 
@@ -115,7 +118,7 @@ def search_anchor():
     if len(query) == 0:
       return jsonify(res)
     # BEGIN SOLUTION
-    
+    res = search_engine.search_anchor(query=query)
     # END SOLUTION
     return jsonify(res)
 
@@ -140,7 +143,7 @@ def get_pagerank():
     if len(wiki_ids) == 0:
       return jsonify(res)
     # BEGIN SOLUTION
-
+    res = search_engine.get_pagerank(wiki_ids=wiki_ids)
     # END SOLUTION
     return jsonify(res)
 
@@ -167,7 +170,7 @@ def get_pageview():
     if len(wiki_ids) == 0:
       return jsonify(res)
     # BEGIN SOLUTION
-
+    res = search_engine.get_pageview(wiki_ids=wiki_ids)
     # END SOLUTION
     return jsonify(res)
 

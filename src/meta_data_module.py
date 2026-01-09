@@ -1,14 +1,18 @@
 # meta_data_module.py
 
 from __future__ import annotations
-
+import io
 from dataclasses import dataclass
 from typing import Optional, Literal
 from io import BytesIO
 import os
-
+import gzip
+import csv
 import numpy as np
 from google.cloud import storage
+import pickle
+from collections import Counter
+from typing import Mapping
 
 
 # ============
@@ -45,6 +49,9 @@ class MetaDataPaths:
     # titles binary files
     titles_data: str          # <-- FILL THIS PATH
     titles_offsets: str       # <-- FILL THIS PATH
+
+    pagerank_csv_gz: Optional[str] = None  # <-- FILL THIS PATH
+    pageviews_pkl: Optional[str] = None
 
 
 StorageMode = Literal["gcs", "local"]
@@ -92,6 +99,12 @@ class MetaDataModule:
             offsets_bytes = _download_blob_bytes(bucket_name, paths.titles_offsets)
             data_bytes = _download_blob_bytes(bucket_name, paths.titles_data)
 
+            pr_bytes = _download_blob_bytes(bucket_name, paths.pagerank_csv_gz)
+
+            if paths.pageviews_pkl:
+                pv_bytes = _download_blob_bytes(bucket_name, paths.pageviews_pkl)
+
+
         elif self.mode == "local":
             # ---- Load numpy arrays into RAM (from local) ----
             self.doc_id_to_pos = self._load_npy_local(paths.doc_id_to_pos)
@@ -102,8 +115,15 @@ class MetaDataModule:
             offsets_bytes = self._read_file_bytes(paths.titles_offsets)
             data_bytes = self._read_file_bytes(paths.titles_data)
 
+            pr_bytes = self._read_file_bytes(paths.pagerank_csv_gz)
+
+            if paths.pageviews_pkl:
+                pv_bytes = self._read_file_bytes(paths.pageviews_pkl)
+
         else:
             raise ValueError(f"Unknown mode: {self.mode!r}. Use 'gcs' or 'local'.")
+        
+
 
         # Determine invalid position sentinel
         if self.doc_id_to_pos.dtype == np.uint32:
@@ -117,6 +137,22 @@ class MetaDataModule:
 
         if self.titles_offsets.size < 2:
             raise ValueError("titles_offsets is too small (need at least 2 offsets).")
+
+        # build page rank array by pos
+        self.pagerank_by_pos = self._build_pagerank_by_pos(pr_bytes)
+
+        if pv_bytes is not None:
+            wid2pv = pickle.loads(pv_bytes)  # Counter or dict
+
+            if not isinstance(wid2pv, (dict, Counter)):
+                raise TypeError(f"pageviews_pkl must unpickle to dict/Counter, got {type(wid2pv)}")
+
+            self.pageviews_by_pos = self._build_pageviews_by_pos(wid2pv)
+
+            # free the huge dict from RAM
+            del wid2pv
+
+        self.avg_doc_len_body = self._compute_avg_doc_len_body()
 
     # -------------------------
     # Load helpers (GCS/local)
@@ -135,6 +171,136 @@ class MetaDataModule:
             raise FileNotFoundError(f"Local file not found: {file_path}")
         with open(file_path, "rb") as f:
             return f.read()
+        
+    # def _build_pagerank_by_pos(self, csv_gz_bytes: bytes) -> np.ndarray:
+    #     """
+    #     Expects a gzipped CSV with (doc_id, pagerank) per row.
+    #     Handles:
+    #       - with/without header
+    #       - extra columns (uses first int-ish as doc_id, first float-ish as rank)
+    #     Produces an array pagerank_by_pos aligned to pos.
+    #     """
+    #     # pos space size: same as doc_norm_body (indexed by pos)
+    #     pr_by_pos = np.zeros(self.doc_norm_body.shape[0], dtype=np.float32)
+
+    #     with gzip.GzipFile(fileobj=BytesIO(csv_gz_bytes), mode="rb") as gz:
+    #         # decode as text for csv reader
+    #         text = gz.read().decode("utf-8", errors="replace").splitlines()
+
+    #     reader = csv.reader(text)
+    #     rows = list(reader)
+    #     if not rows:
+    #         return pr_by_pos
+
+    #     # Detect header (first row not parseable as numbers)
+    #     start_i = 0
+    #     if rows:
+    #         r0 = rows[0]
+    #         try:
+    #             _ = int(r0[0])
+    #             _ = float(r0[1])
+    #         except Exception:
+    #             start_i = 1  # skip header
+
+    #     for r in rows[start_i:]:
+    #         if not r:
+    #             continue
+
+    #         doc_id = None
+    #         rank = None
+
+    #         # find first int-like field
+    #         for x in r:
+    #             try:
+    #                 doc_id = int(x)
+    #                 break
+    #             except Exception:
+    #                 continue
+
+    #         # find first float-like field (after doc_id is fine, but we’ll just scan)
+    #         for x in r:
+    #             try:
+    #                 rank = float(x)
+    #                 break
+    #             except Exception:
+    #                 continue
+
+    #         if doc_id is None or rank is None:
+    #             continue
+
+    #         pos = self._doc_id_to_pos(doc_id)
+    #         if pos is None:
+    #             continue
+
+    #         pr_by_pos[pos] = rank
+
+    #     return pr_by_pos
+
+    def _build_pagerank_by_pos(self, csv_gz_bytes: bytes) -> np.ndarray:
+        """
+        File format (confirmed):
+        doc_id,pagerank
+        3434750,9913.728782160782
+        ...
+        No header, exactly 2 columns.
+
+        Builds pagerank_by_pos aligned to pos (float32 for memory).
+        Missing docs remain 0.0.
+        """
+        pr_by_pos = np.zeros(self.doc_norm_body.shape[0], dtype=np.float32)
+
+        with gzip.GzipFile(fileobj=io.BytesIO(csv_gz_bytes), mode="rb") as gz:
+            text_stream = io.TextIOWrapper(gz, encoding="utf-8", errors="replace", newline="")
+            reader = csv.reader(text_stream)
+
+            for row in reader:
+                # Safe guards
+                if not row or len(row) < 2:
+                    continue
+
+                try:
+                    doc_id = int(row[0])
+                    rank = float(row[1])
+                except Exception:
+                    continue
+
+                pos = self._doc_id_to_pos(doc_id)
+                if pos is None:
+                    continue
+
+                pr_by_pos[pos] = rank
+
+        return pr_by_pos
+    
+    def _build_pageviews_by_pos(self, wid2pv) -> np.ndarray:
+        """
+        Convert doc_id->views dict into a compact array indexed by pos.
+        Missing docs get 0.
+        """
+        pv = np.zeros(self.doc_norm_body.shape[0], dtype=np.uint32)
+
+        for doc_id, views in wid2pv.items():
+            # bounds check for doc_id_to_pos
+            if doc_id < 0 or doc_id >= self.doc_id_to_pos.shape[0]:
+                continue
+
+            pos = self.doc_id_to_pos[doc_id]
+            if pos == self.INVALID_POS:
+                continue
+
+            # clamp to uint32 range just in case
+            v = int(views)
+            if v < 0:
+                v = 0
+            elif v > 2**32 - 1:
+                v = 2**32 - 1
+
+            pv[int(pos)] = v
+
+        return pv
+
+
+
 
     # -------------------------
     # Public API
@@ -169,6 +335,45 @@ class MetaDataModule:
             return ""
 
         return self.titles_data[start:end].tobytes().decode("utf-8", errors="replace")
+    
+    def get_page_rank(self, doc_id: int) -> float:
+        """
+        Returns PageRank for a doc_id (0.0 if missing / unknown).
+        PageRank is stored as an array aligned by pos.
+        """
+        if self.pagerank_by_pos is None:
+            return 0.0
+        pos = self._doc_id_to_pos(doc_id)
+        if pos is None:
+            return 0.0
+        return float(self.pagerank_by_pos[pos])
+    
+    def get_pageviews(self, doc_id: int) -> int:
+        """
+        Returns pageviews for doc_id (0 if missing / not loaded).
+        Uses doc_id->pos mapping + pos-aligned array.
+        """
+        if self.pageviews_by_pos is None:
+            return 0
+        pos = self._doc_id_to_pos(doc_id)
+        if pos is None:
+            return 0
+        return int(self.pageviews_by_pos[pos])
+
+    def get_doc_len_body(self, doc_id: int) -> float:
+        """
+        Returns body doc length for doc_id (0 if missing).
+        Uses inv_doc_len_body: doc_len = 1 / inv_len
+        """
+        inv_len = self.get_inv_doc_len_body(doc_id)
+        if inv_len <= 0.0:
+            return 0.0
+        return 1.0 / inv_len
+
+    def get_avg_doc_len_body(self) -> float:
+        """Average body document length (avgdl) computed once at init."""
+        return float(self.avg_doc_len_body)
+
 
     # -------------------------
     # Private utilities
@@ -182,3 +387,17 @@ class MetaDataModule:
             return None
 
         return int(pos)
+
+
+    def _compute_avg_doc_len_body(self) -> float:
+        """
+        Computes average body document length (avgdl) using inv_doc_len_body:
+            inv_doc_len_body[pos] = 1 / doc_len
+        So doc_len = 1 / inv_len for inv_len > 0.
+        """
+        inv = self.inv_doc_len_body.astype(np.float64, copy=False)
+        mask = inv > 0.0
+        if not np.any(mask):
+            return 0.0
+        lengths = 1.0 / inv[mask]
+        return float(lengths.mean())
