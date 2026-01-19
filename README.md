@@ -333,7 +333,7 @@ This project is part of a university course assignment.
 
 ## 👥 Authors
 
-University Information Retrieval Project
+Moran Shavit & Tamar Hagbiy
 
 ---
 
